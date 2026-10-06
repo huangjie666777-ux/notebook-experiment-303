@@ -27,8 +27,30 @@ PY
 # 2. 启动内核(只在环回地址绑定)
 .venv/bin/python -m runbook_kernel -f connection.json
 
-# 3. 用任意 Jupyter 客户端连接, 例如:
-.venv/bin/jupyter console --existing connection.json
+# 3. 用 jupyter_client 直接连接(项目锁定依赖内即可):
+.venv/bin/python - <<'PY'
+from jupyter_client.blocking import BlockingKernelClient
+
+client = BlockingKernelClient()
+client.load_connection_file("connection.json")
+client.start_channels()
+client.wait_for_ready(timeout=10)
+msg_id = client.execute("21 * 2")
+reply = client.get_shell_msg(timeout=5)
+print("reply:", reply["content"]["status"], reply["content"]["execution_count"])
+while True:
+    msg = client.get_iopub_msg(timeout=5)
+    if msg["parent_header"].get("msg_id") != msg_id:
+        continue
+    if msg["msg_type"] == "execute_result":
+        print("result:", msg["content"]["data"]["text/plain"])
+    if msg["msg_type"] == "status" and msg["content"]["execution_state"] == "idle":
+        break
+client.shutdown()
+PY
+
+> 项目没有锁定 `jupyter-console`; 因此 README 不使用 `.venv/bin/jupyter console`。
+> 如需 REPL, 请在独立环境中额外安装该可选包。
 ```
 
 ## 测试与演示
@@ -39,7 +61,49 @@ PY
 
 # 演示: 执行、异常、中断、关闭的完整过程
 .venv/bin/python examples/demo.py
+
+# Notebook 实验 API: 参数注入、输出笔记与失败行为
+.venv/bin/python examples/notebook_experiment.py
 ```
+
+## Notebook 执行 API
+
+```python
+from runbook_kernel import execute_notebook
+
+result = execute_notebook(
+    input_path="experiment.ipynb",
+    output_path="results/lr-0.01.ipynb",
+    parameters={"learning_rate": 0.01, "layers": [64, 32], "tag": "baseline"},
+    cell_timeout=120,
+    continue_on_error=False,
+)
+print(result.status, result.executed_cells, result.output_path)
+```
+
+参数也可以传 JSON 字符串。参数对象非空时, 输入笔记必须且只能有一个代码单元
+带有 `"parameters"` 标签。规划器先执行该单元中的默认代码, 再在其后插入一个
+`"injected-parameters"` 代码单元; 插入值先通过有限 JSON 校验, 再物化为 Python
+字面量, 字符串始终是带引号的值, 不会拼接成可执行代码。
+
+输出笔记为标准 nbformat 4: 保留原单元 ID、元数据、Markdown/raw 内容和附件,
+保留字符串或字符串数组形式的 `source`; 所有旧 `outputs` 和 `execution_count`
+在执行前清空。执行后代码单元写入 stream、execute_result/display_data、error
+和计数; 未执行单元保持空输出和 `execution_count: null`。
+
+`NotebookExecutionResult.status` 的失败语义:
+
+- `ok`: 所有代码单元成功。
+- `error`: 某个单元异常。默认立即停止; `continue_on_error=True` 时继续后续单元,
+  最终仍返回 `error`。
+- `timeout`: 单元超过 `cell_timeout` 后经 control 通道中断并结束本次实验;
+  已收到的 stdout/stderr/异常会保留, 后续单元不执行。
+
+每次调用都会启动一个全新的 `runbook_kernel` 子进程和新连接文件, 因此不同实验之间
+变量天然隔离。执行器只有在同一父消息 ID 的 `execute_reply` 与 IOPub `idle`
+都到达后才推进下一单元; 迟到消息仍归属于原父 ID。成功、异常和超时都会通过临时文件
+加原子替换写入独立结果笔记, 随后关闭客户端套接字、终止并回收本次内核进程和连接文件。
+输入文件只读, 不会被修改。
 
 ## 目录结构(跨文件协作)
 
@@ -53,13 +117,20 @@ runbook_kernel/
   iopub.py        输出发布: status / execute_input / stream / execute_result / error
   heartbeat.py    心跳线程: REP 回显, 与执行完全解耦
   supervisor.py   进程监管: 信号处理、生命周期、资源回收
+  notebook.py     笔记规划: nbformat 4 校验、参数物化、原子写结果
+  messages.py     IOPub 收集: 按 execute 父消息 ID 归集输出与 idle
+  runner.py       实验监管: 启动独立内核、顺序执行、异常/超时处理与回收
 tests/test_kernel.py   集成测试(真实 jupyter_client)
-examples/demo.py       演示脚本
+examples/demo.py       内核交互演示
+examples/notebook_experiment.py  Notebook API 演示
 ```
 
 协作关系: `supervisor` 驱动 `kernel` 的生命周期; `kernel` 经 `security`
 收发并校验消息, 把执行请求交给主线程的 `execution` 执行上下文, 执行产出经
 `iopub` 实时发布; `heartbeat` 独立应答存活探测。
+
+Notebook 路径由三层协作: `notebook` 深拷贝并规划单元, `messages` 的后台线程持续
+排空 IOPub, `runner` 私有启动内核并按单元同步等待 shell 终态与对应 idle。
 
 ## 协议行为
 
