@@ -11,3 +11,4 @@ connection*.json
 build/
 dist/
 *.egg-info/
+examples/out/
